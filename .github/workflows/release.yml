@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      qemu_version:
+        description: QEMU version
+        type: choice
+        options:
+          - 11.1.3
+          - 7.2.22
+        default: 11.1.3
+      release_tag:
+        description: Release tag; leave empty to build artifacts only
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  QEMU_VERSION: ${{ inputs.qemu_version || '11.1.3' }}
+  NDK_VERSION: 30.0.16248370
+  ANDROID_PLATFORM: 37
+  ANDROID_BUILD_TOOLS: 37.0.0
+  VIRGL_COMMIT: 32dac0c627fba374709102c114f2896b7c899f46
+  GRADLE_OPTS: -Dorg.gradle.daemon=false
+
+jobs:
+  build:
+    name: Build ${{ matrix.guest }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest: x86
+            module: qube-android-x86
+            target: x86_64-softmmu
+          - guest: arm
+            module: qube-android-arm
+            target: aarch64-softmmu
+          - guest: ppc
+            module: qube-android-ppc
+            target: ppc64-softmmu
+          - guest: sparc
+            module: qube-android-sparc
+            target: sparc-softmmu
+          - guest: m68k
+            module: qube-android-m68k
+            target: m68k-softmmu
+          - guest: hppa
+            module: qube-android-hppa
+            target: hppa-softmmu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android/sdk/emulator \
+            /usr/local/lib/android/sdk/system-images \
+            /opt/ghc \
+            /usr/local/share/boost
+          sudo apt-get clean
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}"
+          yes | sdkmanager --licenses > /dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            curl \
+            flex \
+            gettext \
+            git \
+            gtk-doc-tools \
+            libtool \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-pip \
+            rsync \
+            texinfo \
+            unzip \
+            xz-utils
+          python3 -m pip install --user --break-system-packages --upgrade meson mako
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Cache native sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/qube-sources
+          key: qube-sources-v1-${{ env.QEMU_VERSION }}
+
+      - name: Download native sources
+        run: |
+          set -euo pipefail
+          cache="${HOME}/.cache/qube-sources"
+          mkdir -p "${cache}"
+          fetch() {
+            local url="$1"
+            local file="$2"
+            if [[ ! -f "${cache}/${file}" ]]; then
+              curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o "${cache}/${file}" "${url}"
+            fi
+          }
+          fetch "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" "qemu-${QEMU_VERSION}.tar.xz"
+          fetch "https://download.gnome.org/sources/glib/2.90/glib-2.90.1.tar.xz" "glib-2.90.1.tar.xz"
+          fetch "https://github.com/libffi/libffi/releases/download/v3.8.0/libffi-3.8.0.tar.gz" "libffi-3.8.0.tar.gz"
+          fetch "https://gitlab.freedesktop.org/pixman/pixman/-/archive/pixman-0.46.4/pixman-pixman-0.46.4.tar.gz" "pixman-pixman-0.46.4.tar.gz"
+          fetch "https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.9.5/libslirp-v4.9.5.zip" "libslirp-v4.9.5.zip"
+          fetch "https://github.com/anholt/libepoxy/archive/refs/tags/1.5.10.zip" "libepoxy-1.5.10.zip"
+          fetch "https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/${VIRGL_COMMIT}/virglrenderer-${VIRGL_COMMIT}.tar.gz" "virglrenderer-${VIRGL_COMMIT}.tar.gz"
+
+      - name: Prepare native sources
+        working-directory: qube-android-lib/src/main/jni
+        run: |
+          set -euo pipefail
+          cache="${HOME}/.cache/qube-sources"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "${tmp}"' EXIT
+
+          rm -rf qemu glib libffi pixman libepoxy virglrenderer
+          mkdir -p qemu glib libffi pixman libepoxy virglrenderer
+
+          tar -xJf "${cache}/qemu-${QEMU_VERSION}.tar.xz" -C qemu --strip-components=1
+          tar -xJf "${cache}/glib-2.90.1.tar.xz" -C glib --strip-components=1
+          tar -xzf "${cache}/libffi-3.8.0.tar.gz" -C libffi --strip-components=1
+          tar -xzf "${cache}/pixman-pixman-0.46.4.tar.gz" -C pixman --strip-components=1
+          tar -xzf "${cache}/virglrenderer-${VIRGL_COMMIT}.tar.gz" -C virglrenderer --strip-components=1
+
+          unzip -q "${cache}/libepoxy-1.5.10.zip" -d "${tmp}/epoxy"
+          epoxy_dir="$(find "${tmp}/epoxy" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "${epoxy_dir}"
+          cp -a "${epoxy_dir}/." libepoxy/
+
+          unzip -q "${cache}/libslirp-v4.9.5.zip" -d "${tmp}/libslirp"
+          libslirp_dir="$(find "${tmp}/libslirp" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "${libslirp_dir}"
+          mkdir -p qemu/subprojects/libslirp
+          cp -a "${libslirp_dir}/." qemu/subprojects/libslirp/
+
+          patch -d qemu -p1 < "patches/qemu-${QEMU_VERSION}.patch"
+          if [[ "${QEMU_VERSION}" == "7.2.22" ]]; then
+            patch -d glib -p1 < patches/glib-2.90.1-qemu7.patch
+          else
+            patch -d glib -p1 < patches/glib-2.90.1.patch
+          fi
+          patch -d qemu/subprojects/libslirp -p1 < patches/libslirp-4.9.5.patch
+          patch -d virglrenderer -p1 < patches/virglrenderer-1.3.0-android-egl.patch
+
+          (cd pixman && bash autogen.sh)
+
+      - name: Build native libraries
+        working-directory: qube-android-lib/src/main/jni
+        env:
+          USE_QEMU_VERSION: ${{ env.QEMU_VERSION }}
+          BUILD_HOST: arm64-v8a
+          BUILD_GUEST: ${{ matrix.target }}
+          USE_OPTIMIZATION: 'true'
+        run: |
+          export NDK_ROOT="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          export BUILD_THREADS="$(nproc)"
+          make qube
+
+      - name: Build release APK
+        env:
+          MODULE: ${{ matrix.module }}
+        run: |
+          set -euo pipefail
+          ./gradlew ":${MODULE}:assembleRelease" \
+            -PqemuVersion="${QEMU_VERSION}" \
+            --no-daemon \
+            --stacktrace
+          mkdir -p artifacts
+          find "${MODULE}/build/outputs/apk/release" -type f -name '*.apk' -exec cp -v {} artifacts/ \;
+          test -n "$(find artifacts -type f -name '*.apk' -print -quit)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: qube-${{ matrix.guest }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.apk > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: QubeVM ${{ env.RELEASE_TAG }}
+          body: |
+            QubeVM build from ${{ github.sha }}.
+            QEMU ${{ env.QEMU_VERSION }}.
+            Android host ABI: arm64-v8a.
+          files: artifacts/*
+          fail_on_unmatched_files: true
