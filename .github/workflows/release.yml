@@ -188,8 +188,6 @@ jobs:
           patch -d qemu/subprojects/libslirp -p1 < patches/libslirp-4.9.5.patch
           patch -d virglrenderer -p1 < patches/virglrenderer-1.3.0-android-egl.patch
 
-          (cd pixman && bash autogen.sh)
-
       - name: Build native libraries
         working-directory: qube-android-lib/src/main/jni
         env:
